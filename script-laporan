@@ -1,0 +1,639 @@
+// ============================================================
+// KITCHEN REPORT SCRIPT
+// v3.1 - CEK: Border, Col Limit U, RAB/KOP Colors, O merah
+// ============================================================
+
+const COL_WIDTHS = {
+  1: 115, 2: 115, 3: 115, 4: 115, 5: 115,
+  6: 15,  7: 115, 8: 115, 9: 115, 10: 115, 11: 115
+};
+
+// CEK CONFIG
+const HARIAN_BG_DEFAULT = "#EAF4FF"; // light biru (koperasi, dll)
+const HARIAN_BG_GAS     = "#FFF2CC"; // light kuning khusus GAS
+const MAX_CEK_COL  = 21;        // Batas kolom U (1 TANGGAL + 10 dapur x 2)
+const CEK_DATE_BG  = "#DAEEF3"; // Background kolom TANGGAL (data rows)
+const CEK_RAB_BG   = "#E8E8E8"; // Light grey untuk kolom RAB
+const CEK_KOP_BG   = "#FFF8DC"; // Cream untuk kolom KOP
+const CEK_RAB_HDR  = "#BFBFBF"; // Header RAB (sedikit lebih gelap)
+const CEK_KOP_HDR  = "#FFE699"; // Header KOP (golden cream)
+
+// ====================== MENU ======================
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu("📋 Menu")
+    .addItem("Setup LAPORAN", "setupLaporan")
+    .addItem("Setup CEK", "setupCek")
+    .addSeparator()
+    .addItem("Harian", "generateHarian")
+    .addItem("Filter", "generateFilter")
+    .addItem("Semua", "generateAll")
+    .addSeparator()
+    .addItem("Warna HARIAN", "applyHarianColoring")
+    .addToUi();
+}
+
+function applyHarianColoring() {
+  const ss     = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet  = ss.getSheetByName("HARIAN");
+  if (!sheet) return alert_("❌ Sheet HARIAN tidak ditemukan!");
+
+  const parsed = parseHarianHeaders_();
+  if (!parsed) return alert_("❌ Header HARIAN tidak terbaca!");
+
+  const { headerRow } = parsed;
+
+  const lastRow = sheet.getLastRow();
+  const lastCol = sheet.getLastColumn();
+
+  if (lastRow <= headerRow + 1) return;
+
+  const startRow = headerRow + 2;
+  const numRows  = lastRow - headerRow - 1;
+
+  const subHeader = sheet.getRange(headerRow + 1, 1, 1, lastCol).getValues()[0];
+
+  for (let c = 1; c < subHeader.length; c++) {
+    const val = String(subHeader[c]).toUpperCase().trim();
+
+    // skip kolom yang tidak perlu
+    if (!val || val === "RAB" || val === "SELISIH") continue;
+
+    let color = HARIAN_BG_DEFAULT;
+
+    if (val === "GAS") {
+      color = HARIAN_BG_GAS;
+    }
+
+    const range = sheet.getRange(startRow, c + 1, numRows, 1);
+    range.setBackground(color);
+  }
+
+  SpreadsheetApp.getUi().alert("✅ Pewarnaan HARIAN selesai");
+}
+
+function applyHarianColoringOnEdit_(e) {
+  const sheet = e.range.getSheet();
+  if (sheet.getName() !== "HARIAN") return;
+
+  const parsed = parseHarianHeaders_();
+  if (!parsed) return;
+
+  const { headerRow } = parsed;
+
+  const row = e.range.getRow();
+  const col = e.range.getColumn();
+
+  if (row <= headerRow + 1) return;
+
+  const header = sheet.getRange(headerRow + 1, col).getValue();
+  const val = String(header).toUpperCase().trim();
+
+  if (!val || val === "RAB" || val === "SELISIH") return;
+
+  let color = HARIAN_BG_DEFAULT;
+
+  if (val === "GAS") {
+    color = HARIAN_BG_GAS;
+  }
+
+  e.range.setBackground(color);
+}
+
+// ====================== ON EDIT ======================
+function onEdit(e) {
+  if (!e || !e.range || !e.source) return;
+
+  const sheetName = e.source.getActiveSheet().getName();
+  const cell = e.range.getA1Notation();
+  const val  = e.range.getValue();
+
+if (sheetName === "HARIAN") {
+  if (val === true) {
+    if (cell === "A1") { e.range.setValue(false); setupLaporan(); return; }
+    if (cell === "A2") { e.range.setValue(false); setupCek();    return; }
+  }
+
+  updateCekFromHarian_(e);
+
+  // 🔽 TAMBAHAN AUTO COLOR (ringan, hanya 1 kolom)
+  applyHarianColoringOnEdit_(e);
+
+  return;
+}
+
+  if (sheetName === "LAPORAN" && val === true) {
+  e.range.setValue(false);
+  if      (cell === "B1") generateHarian();
+  else if (cell === "H1") generateFilter();
+  else if (cell === "B2") generateAll();
+  else if (cell === "H2") setupLaporan();
+  }
+}
+
+// ====================== SETUP LAPORAN ======================
+function setupLaporan() {
+  const ss  = SpreadsheetApp.getActiveSpreadsheet();
+  const lap = ss.getSheetByName("LAPORAN") || ss.insertSheet("LAPORAN");
+
+  lap.clearContents();
+  lap.clearFormats();
+  lap.clearConditionalFormatRules();
+
+  Object.entries(COL_WIDTHS).forEach(([col, w]) => lap.setColumnWidth(Number(col), w));
+  [1, 2, 3, 4].forEach(r => lap.setRowHeight(r, 30));
+  lap.setRowHeight(5, 15);
+
+const buttons = [
+  { r: 1, c: 1, label: "HARIAN" },
+  { r: 1, c: 7, label: "FILTER" },
+  { r: 2, c: 1, label: "SEMUA"  },
+  { r: 2, c: 7, label: "RESET" }
+];
+buttons.forEach(({ r, c, label }) => {
+  lap.getRange(r, c)
+    .setValue(label).setFontWeight("bold").setFontSize(10)
+    .setHorizontalAlignment("center").setVerticalAlignment("middle");
+  lap.getRange(r, c + 1)
+    .insertCheckboxes().setValue(false)
+    .setHorizontalAlignment("center").setVerticalAlignment("middle");
+});
+
+  const dv    = SpreadsheetApp.newDataValidation().requireDate().setAllowInvalid(false).build();
+  const today = new Date();
+  const first = new Date(today.getFullYear(), today.getMonth(), 1);
+
+  lap.getRange("D1").setValue("TANGGAL").setFontWeight("bold")
+    .setHorizontalAlignment("center").setVerticalAlignment("middle");
+  lap.getRange("E1").setValue(today).setNumberFormat("dd-MM-yyyy").setDataValidation(dv)
+    .setHorizontalAlignment("center").setVerticalAlignment("middle");
+
+  lap.getRange("J1").setValue("TANGGAL AWAL").setFontWeight("bold")
+    .setHorizontalAlignment("center").setVerticalAlignment("middle");
+  lap.getRange("K1").setValue(first).setNumberFormat("dd-MM-yyyy").setDataValidation(dv)
+    .setHorizontalAlignment("center").setVerticalAlignment("middle");
+
+  lap.getRange("J2").setValue("TANGGAL AKHIR").setFontWeight("bold")
+    .setHorizontalAlignment("center").setVerticalAlignment("middle");
+  lap.getRange("K2").setValue(today).setNumberFormat("dd-MM-yyyy").setDataValidation(dv)
+    .setHorizontalAlignment("center").setVerticalAlignment("middle");
+
+  lap.getRange("F1:F5").setBackground("#FFFFFF");
+
+  const harian = ss.getSheetByName("HARIAN");
+  if (harian) {
+    harian.getRange("A1").insertCheckboxes().setValue(false)
+      .setHorizontalAlignment("center").setVerticalAlignment("middle");
+  }
+}
+
+// ====================== SETUP CEK ======================
+function setupCek() {
+  const ss  = SpreadsheetApp.getActiveSpreadsheet();
+  const cek = ss.getSheetByName("CEK") || ss.insertSheet("CEK");
+
+  cek.clearContents();
+  cek.clearFormats();
+
+  const parsed = getCekDapurList_();
+  if (!parsed) return alert_("❌ Header HARIAN tidak ditemukan!");
+
+  const { dapurList } = parsed;
+  const totalCols = 1 + dapurList.length * 2;
+
+  // Header TANGGAL (merge row 1-2)
+  cek.getRange(1, 1, 2, 1).merge()
+    .setValue("TANGGAL").setFontWeight("bold")
+    .setHorizontalAlignment("center").setVerticalAlignment("middle")
+    .setBackground("#4472C4").setFontColor("#FFFFFF");
+
+  // Header per dapur
+  let col = 2;
+  for (const d of dapurList) {
+    cek.getRange(1, col, 1, 2).merge()
+      .setValue(d.name).setFontWeight("bold")
+      .setHorizontalAlignment("center").setVerticalAlignment("middle")
+      .setBackground("#EECBBD").setFontColor("#000000");
+    cek.getRange(2, col)
+      .setValue("RAB").setFontWeight("bold")
+      .setBackground(CEK_RAB_HDR).setHorizontalAlignment("center");
+    cek.getRange(2, col + 1)
+      .setValue("KOP").setFontWeight("bold")
+      .setBackground(CEK_KOP_HDR).setHorizontalAlignment("center");
+    col += 2;
+  }
+
+  // Column widths
+  cek.setColumnWidth(1, 110);
+  for (let c = 2; c <= totalCols; c++) cek.setColumnWidth(c, 55);
+
+  // Border header rows 1-2
+  cek.getRange(1, 1, 2, totalCols)
+    .setBorder(true, true, true, true, true, true,
+      "#000000", SpreadsheetApp.BorderStyle.SOLID_MEDIUM);
+
+  cek.setFrozenRows(2);
+
+  const harian = ss.getSheetByName("HARIAN");
+  if (harian) {
+    harian.getRange("A2").insertCheckboxes().setValue(false)
+      .setHorizontalAlignment("center").setVerticalAlignment("middle");
+  }
+
+  populateCekFromHarian_();
+}
+
+// ====================== CEK HELPERS ======================
+
+/**
+ * Ambil dapurList dari HARIAN, dibatasi sampai kolom U (MAX_CEK_COL).
+ */
+function getCekDapurList_() {
+  const parsed = parseHarianHeaders_();
+  if (!parsed) return null;
+  const maxDapurs = Math.floor((MAX_CEK_COL - 1) / 2); // = 10
+  return {
+    ...parsed,
+    dapurList: parsed.dapurList.slice(0, maxDapurs)
+  };
+}
+
+function parseHarianHeaders_() {
+  const harian = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("HARIAN");
+  if (!harian) return null;
+
+  const data      = harian.getDataRange().getValues();
+  const headerRow = data.findIndex(row => String(row[1]).toUpperCase().trim() === "RAB");
+  if (headerRow === -1) return null;
+
+  const locRow    = data[headerRow - 1];
+  const subRow    = data[headerRow];
+  const dapurList = [];
+  let cur = null;
+  let collectingKop = false;
+
+  for (let c = 1; c < subRow.length; c++) {
+    if (locRow[c] && typeof locRow[c] === "string" && locRow[c].trim() !== "") {
+      cur = { name: locRow[c].trim(), rabCol: -1, kopCol: -1, kopCols: [] };
+      collectingKop = false;
+    }
+    if (!cur) continue;
+    const sub = String(subRow[c]).toUpperCase().trim();
+    if (sub === "RAB")      { cur.rabCol = c; collectingKop = false; }
+    if (sub === "KOPERASI") { cur.kopCol = c; cur.kopCols.push(c); collectingKop = true; }
+    else if (collectingKop && sub !== "SELISIH") { cur.kopCols.push(c); }
+    if (sub === "SELISIH")  { collectingKop = false; dapurList.push({ ...cur }); cur = null; }
+  }
+
+  return { dapurList, headerRow, dataStartRow: headerRow + 1 };
+}
+
+/**
+ * Cari baris tanggal di CEK. Kalau tidak ada, buat baris baru.
+ */
+function findOrCreateDateRow_(cek, dateVal) {
+  const tz      = Session.getScriptTimeZone();
+  const dateKey = Utilities.formatDate(dateVal, tz, "yyyy-MM-dd");
+  const lastRow = cek.getLastRow();
+
+  if (lastRow >= 3) {
+    const dates = cek.getRange(3, 1, lastRow - 2, 1).getValues();
+    for (let r = 0; r < dates.length; r++) {
+      if (dates[r][0] instanceof Date &&
+          Utilities.formatDate(dates[r][0], tz, "yyyy-MM-dd") === dateKey) {
+        return r + 3;
+      }
+    }
+  }
+
+  const newRow = Math.max(lastRow + 1, 3);
+  cek.getRange(newRow, 1)
+    .setValue(dateVal).setNumberFormat("dd-MM-yy")
+    .setHorizontalAlignment("center").setFontWeight("bold")
+    .setBackground(CEK_DATE_BG);
+  return newRow;
+}
+
+/**
+ * Set satu sel CEK:
+ *   hasData true  → ✓ hijau
+ *   hasData false → O merah
+ * Background: col genap = RAB grey, col ganjil = KOP cream
+ */
+function setCekCell_(cek, row, col, hasData) {
+  const bg   = (col % 2 === 0) ? CEK_RAB_BG : CEK_KOP_BG;
+  const cell = cek.getRange(row, col);
+  if (hasData) {
+    cell.setValue("✓")
+      .setFontColor("#1E8449").setFontWeight("bold").setFontSize(12)
+      .setHorizontalAlignment("center").setBackground(bg);
+  } else {
+    cell.setValue("O")
+      .setFontColor("#FF0000").setFontWeight("bold").setFontSize(11)
+      .setHorizontalAlignment("center").setBackground(bg);
+  }
+}
+
+/**
+ * Terapkan border solid ke satu baris data CEK.
+ */
+function applyCekRowBorder_(cek, row, totalCols) {
+  cek.getRange(row, 1, 1, totalCols)
+    .setBorder(true, true, true, true, true, true,
+      "#AAAAAA", SpreadsheetApp.BorderStyle.SOLID);
+}
+
+function populateCekFromHarian_() {
+  const ss     = SpreadsheetApp.getActiveSpreadsheet();
+  const harian = ss.getSheetByName("HARIAN");
+  const cek    = ss.getSheetByName("CEK");
+  if (!harian || !cek) return;
+
+  const parsed = getCekDapurList_();
+  if (!parsed) return;
+
+  const { dapurList, dataStartRow } = parsed;
+  const data      = harian.getDataRange().getValues();
+  const totalCols = 1 + dapurList.length * 2;
+
+  for (let i = dataStartRow; i < data.length; i++) {
+    if (!(data[i][0] instanceof Date)) continue;
+    const cekRow = findOrCreateDateRow_(cek, data[i][0]);
+
+    for (let di = 0; di < dapurList.length; di++) {
+      const d = dapurList[di];
+      setCekCell_(cek, cekRow, 2 + di * 2,     !!(data[i][d.rabCol] && Number(data[i][d.rabCol]) !== 0));
+      setCekCell_(cek, cekRow, 2 + di * 2 + 1, !!(data[i][d.kopCol] && Number(data[i][d.kopCol]) !== 0));
+    }
+
+    applyCekRowBorder_(cek, cekRow, totalCols);
+  }
+}
+
+function updateCekFromHarian_(e) {
+  const parsed = getCekDapurList_();
+  if (!parsed) return;
+
+  const { dapurList, headerRow } = parsed;
+  const editedRow    = e.range.getRow();
+  const editedColIdx = e.range.getColumn() - 1; // 0-based
+
+  if (editedRow <= headerRow + 1) return;
+
+  const sheet   = e.source.getActiveSheet();
+  const rowData = sheet.getRange(editedRow, 1, 1, sheet.getLastColumn()).getValues()[0];
+  if (!(rowData[0] instanceof Date)) return;
+
+  const cek = e.source.getSheetByName("CEK");
+  if (!cek) return;
+
+  const totalCols = 1 + dapurList.length * 2;
+
+  for (let di = 0; di < dapurList.length; di++) {
+    const d = dapurList[di];
+    if (editedColIdx === d.rabCol) {
+      const cekRow = findOrCreateDateRow_(cek, rowData[0]);
+      setCekCell_(cek, cekRow, 2 + di * 2, !!(rowData[d.rabCol] && Number(rowData[d.rabCol]) !== 0));
+      applyCekRowBorder_(cek, cekRow, totalCols);
+      break;
+    }
+    if (editedColIdx === d.kopCol) {
+      const cekRow = findOrCreateDateRow_(cek, rowData[0]);
+      setCekCell_(cek, cekRow, 2 + di * 2 + 1, !!(rowData[d.kopCol] && Number(rowData[d.kopCol]) !== 0));
+      applyCekRowBorder_(cek, cekRow, totalCols);
+      break;
+    }
+  }
+}
+
+// ====================== LAPORAN DATA ======================
+function getDapurData_(start, end) {
+  const harian = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("HARIAN");
+  if (!harian) return null;
+
+  const data      = harian.getDataRange().getValues();
+  const headerRow = data.findIndex(row => String(row[1]).toUpperCase().trim() === "RAB");
+  if (headerRow === -1) return null;
+
+  const locRow    = data[headerRow - 1];
+  const subRow    = data[headerRow];
+  const dapurList = [];
+  let cur = null;
+  let collectingKop = false;
+
+  for (let c = 1; c < subRow.length; c++) {
+    if (locRow[c] && typeof locRow[c] === "string" && locRow[c].trim() !== "") {
+      cur = { name: locRow[c].trim(), kopEntries: [] };
+      collectingKop = false;
+    }
+    if (!cur) continue;
+    const sub = String(subRow[c]).toUpperCase().trim();
+    if (sub === "RAB")      { cur.belanja = c; collectingKop = false; }
+    if (sub === "KOPERASI") { cur.kopEntries.push({ col: c, name: subRow[c] }); collectingKop = true; }
+    else if (collectingKop && sub !== "SELISIH") { cur.kopEntries.push({ col: c, name: subRow[c] }); }
+    if (sub === "SELISIH")  {
+      collectingKop = false;
+      cur.sisa = c;
+      cur.pm   = Number(data[0][c]) || 0;
+      dapurList.push({ ...cur });
+      cur = null;
+    }
+  }
+
+  dapurList.sort((a, b) => a.name.localeCompare(b.name));
+
+  const totals = {};
+  dapurList.forEach(d => {
+    totals[d.name] = { pm: d.pm, belanja: 0, koperasi: 0, sisa: 0, supplierDetail: {} };
+    d.kopEntries.forEach(e => { totals[d.name].supplierDetail[e.name] = 0; });
+  });
+
+  let hasData = false;
+  for (let i = headerRow + 1; i < data.length; i++) {
+    if (!(data[i][0] instanceof Date)) continue;
+    const dt = new Date(data[i][0]); dt.setHours(0, 0, 0, 0);
+    if (dt < start || dt > end) continue;
+    hasData = true;
+    for (const dp of dapurList) {
+      totals[dp.name].belanja += Number(data[i][dp.belanja]) || 0;
+      totals[dp.name].sisa    += Number(data[i][dp.sisa])   || 0;
+      dp.kopEntries.forEach(e => {
+        const val = Number(data[i][e.col]) || 0;
+        totals[dp.name].koperasi    += val;
+        totals[dp.name].supplierDetail[e.name] += val;
+      });
+    }
+  }
+
+  if (!hasData) {
+    alert_("⚠️ Tidak ada data di rentang tanggal tersebut.");
+    return null;
+  }
+
+  return { dapurList, totals };
+}
+
+// ====================== WRITE TABEL ======================
+function writeTabel_(lap, startCol, title, result, dateInfo) {
+  const { dapurList, totals } = result;
+  const TITLE_ROW = 6;
+  const HDR_ROW   = 7;
+  const DATA_ROW  = 8;
+
+  lap.getRange(TITLE_ROW, startCol, dapurList.length + 4, 5).clearContent().clearFormat();
+
+  if (dateInfo.single) {
+    lap.getRange(TITLE_ROW, startCol, 1, 4).merge()
+      .setValue(title).setFontWeight("bold").setFontSize(12)
+      .setHorizontalAlignment("center").setVerticalAlignment("middle")
+      .setBackground("#4472C4").setFontColor("#FFFFFF");
+    lap.getRange(TITLE_ROW, startCol + 4)
+      .setValue(dateInfo.single).setNumberFormat("dd-MM-yyyy")
+      .setFontWeight("bold").setFontSize(11)
+      .setHorizontalAlignment("center").setVerticalAlignment("middle")
+      .setBackground("#4472C4").setFontColor("#FFFFFF");
+  } else {
+    lap.getRange(TITLE_ROW, startCol, 1, 3).merge()
+      .setValue(title).setFontWeight("bold").setFontSize(12)
+      .setHorizontalAlignment("center").setVerticalAlignment("middle")
+      .setBackground("#4472C4").setFontColor("#FFFFFF");
+    lap.getRange(TITLE_ROW, startCol + 3)
+      .setValue(dateInfo.start).setNumberFormat("dd-MM-yyyy")
+      .setFontWeight("bold").setFontSize(11)
+      .setHorizontalAlignment("center").setVerticalAlignment("middle")
+      .setBackground("#4472C4").setFontColor("#b6d7a8");
+    lap.getRange(TITLE_ROW, startCol + 4)
+      .setValue(dateInfo.end).setNumberFormat("dd-MM-yyyy")
+      .setFontWeight("bold").setFontSize(11)
+      .setHorizontalAlignment("center").setVerticalAlignment("middle")
+      .setBackground("#4472C4").setFontColor("#ea9999");
+  }
+  lap.setRowHeight(TITLE_ROW, 28);
+
+  lap.getRange(HDR_ROW, startCol, 1, 5)
+    .setValues([["SPPG", "TOTAL PM", "BELANJA", "SUPPLIER", "SELISIH"]])
+    .setFontWeight("bold").setBackground("#BDD7EE").setFontColor("#000000")
+    .setHorizontalAlignment("center").setVerticalAlignment("middle");
+  lap.setRowHeight(HDR_ROW, 26);
+
+  let outRow = DATA_ROW;
+  for (const d of dapurList) {
+    const t  = totals[d.name];
+    const bg = (outRow % 2 === 0) ? "#F0F4FA" : "#FFFFFF";
+
+    lap.getRange(outRow, startCol, 1, 5)
+      .setValues([[d.name, t.pm, t.belanja, t.koperasi, t.sisa]])
+      .setHorizontalAlignment("center").setVerticalAlignment("middle");
+
+    lap.getRange(outRow, startCol).setBackground(bg);
+    lap.getRange(outRow, startCol + 1).setBackground(bg).setNumberFormat("#,##0");
+    lap.getRange(outRow, startCol + 2, 1, 2).setBackground(bg).setNumberFormat('"Rp." #,##0');
+
+    const sisaCell = lap.getRange(outRow, startCol + 4);
+    sisaCell.setNumberFormat('"Rp." #,##0').setFontWeight("bold")
+      .setBackground(t.sisa > 0 ? "#C6EFCE" : t.sisa < 0 ? "#FFC7CE" : bg);
+
+    outRow++;
+  }
+
+  const totBelanja  = Object.values(totals).reduce((a, b) => a + b.belanja,  0);
+  const totKoperasi = Object.values(totals).reduce((a, b) => a + b.koperasi, 0);
+  const totSisa     = Object.values(totals).reduce((a, b) => a + b.sisa,     0);
+
+  lap.getRange(outRow, startCol, 1, 5)
+    .setValues([["TOTAL", "", totBelanja, totKoperasi, totSisa]])
+    .setFontWeight("bold").setBackground("#4472C4").setFontColor("#FFFFFF")
+    .setHorizontalAlignment("center").setVerticalAlignment("middle");
+  lap.getRange(outRow, startCol + 2, 1, 3).setNumberFormat('"Rp." #,##0');
+
+  lap.getRange(TITLE_ROW, startCol, outRow - TITLE_ROW + 1, 5)
+    .setBorder(true, true, true, true, true, true,
+      "#000000", SpreadsheetApp.BorderStyle.SOLID_MEDIUM);
+}
+
+// ========DATA SUPLIER========
+function writeSupplierDetail_(lap, startCol, result, mainEndRow) {
+  const { dapurList, totals } = result;
+
+  const multiSupplier = dapurList.filter(d => d.kopEntries.length > 1);
+  if (multiSupplier.length === 0) return;
+
+  const allSuppliers = [];
+  multiSupplier.forEach(d => {
+    d.kopEntries.forEach(e => {
+      if (!allSuppliers.includes(e.name)) allSuppliers.push(e.name);
+    });
+  });
+
+  const detailRow = mainEndRow + 2;
+  const totalCols = 1 + allSuppliers.length;
+
+  lap.getRange(detailRow, startCol, 1, totalCols).merge()
+    .setValue("DETAIL SUPPLIER").setFontWeight("bold").setFontSize(11)
+    .setHorizontalAlignment("center").setBackground("#4472C4").setFontColor("#FFFFFF");
+
+  lap.getRange(detailRow + 1, startCol, 1, totalCols)
+    .setValues([["SPPG", ...allSuppliers]])
+    .setFontWeight("bold").setBackground("#BDD7EE").setHorizontalAlignment("center");
+
+  let r = detailRow + 2;
+  for (const d of multiSupplier) {
+    const bg  = (r % 2 === 0) ? "#F0F4FA" : "#FFFFFF";
+    const row = [d.name, ...allSuppliers.map(s => totals[d.name].supplierDetail[s] || 0)];
+    lap.getRange(r, startCol, 1, totalCols).setValues([row])
+      .setHorizontalAlignment("center").setBackground(bg);
+    lap.getRange(r, startCol + 1, 1, allSuppliers.length).setNumberFormat('"Rp." #,##0');
+    r++;
+  }
+
+  lap.getRange(detailRow, startCol, r - detailRow, totalCols)
+    .setBorder(true, true, true, true, true, true,
+      "#000000", SpreadsheetApp.BorderStyle.SOLID_MEDIUM);
+}
+
+// ====================== GENERATE ======================
+function generateHarian() {
+  const lap = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("LAPORAN");
+  if (!lap) return alert_("❌ Sheet LAPORAN tidak ditemukan!");
+
+  const tgl = lap.getRange("E1").getValue();
+  if (!(tgl instanceof Date)) return alert_("❌ Tanggal Harian tidak valid!");
+
+  const start = new Date(tgl); start.setHours(0,  0,  0,   0);
+  const end   = new Date(tgl); end.setHours(23, 59, 59, 999);
+
+  const result = getDapurData_(start, end);
+  if (result) {
+    writeTabel_(lap, 1, "LAPORAN HARIAN", result, { single: tgl });
+    writeSupplierDetail_(lap, 1, result, 8 + result.dapurList.length);
+  }
+}
+
+function generateFilter() {
+  const lap = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("LAPORAN");
+  if (!lap) return alert_("❌ Sheet LAPORAN tidak ditemukan!");
+
+  const awal  = lap.getRange("K1").getValue();
+  const akhir = lap.getRange("K2").getValue();
+  if (!(awal instanceof Date) || !(akhir instanceof Date)) return alert_("❌ Tanggal Filter tidak valid!");
+
+  const start = new Date(awal);  start.setHours(0,  0,  0,   0);
+  const end   = new Date(akhir); end.setHours(23, 59, 59, 999);
+
+  const result = getDapurData_(start, end);
+  if (result) {
+    result.dapurList.sort((a, b) => result.totals[b.name].sisa - result.totals[a.name].sisa);
+    writeTabel_(lap, 7, "LAPORAN FILTER", result, { start: awal, end: akhir });
+    writeSupplierDetail_(lap, 7, result, 8 + result.dapurList.length);
+  }
+}
+
+function generateAll() {
+  generateHarian();
+  generateFilter();
+}
+
+// ====================== UTIL ======================
+function alert_(msg) {
+  SpreadsheetApp.getUi().alert(msg);
+}
