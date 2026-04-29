@@ -1,6 +1,10 @@
-// Kitchen Report Script v7.0
-// Perubahan dari v6: single-pass data collection, batch API calls,
-// onEdit lebih hemat, CEK date cache, gaya kode lebih wajar
+// Kitchen Report Script v7.4
+// v7.0: single-pass data, batch API, onEdit hemat, CEK date cache
+// v7.1: gas CIBAREGBEG & WARBIT masuk BRI
+// v7.2: fix merge rekap bank, border count
+// v7.3: supplier font color, selisih HARIAN plain, highlight today auto
+// v7.4: highlight today efisien (2 baris aja), font supplier batch,
+//       hapus double highlightToday, setupCek clear data lama dulu
 
 const SHEET = { HARIAN: "HARIAN", LAPORAN: "LAPORAN", CEK: "CEK" };
 const COL_WIDTHS = {
@@ -8,17 +12,19 @@ const COL_WIDTHS = {
   6: 15, 7: 115, 8: 115, 9: 115, 10: 115, 11: 115
 };
 
-// RAB ke BRI, sisanya BNI. Gas semua ke BNI.
-const BRI_DAPURS = ["SUKARAJA", "CIHAUR", "CIBAREGBEG", "WARBIT"];
+const BRI_DAPURS     = ["SUKARAJA", "CIHAUR", "CIBAREGBEG", "WARBIT"];
+const BRI_GAS_DAPURS = ["CIBAREGBEG", "WARBIT"];
 
-const CEK_DATE_BG  = "#DAEEF3";
-const CEK_RAB_BG   = "#E8E8E8";
-const CEK_KOP_BG   = "#FFF8DC";
-const CEK_RAB_HDR  = "#BFBFBF";
-const CEK_KOP_HDR  = "#FFE699";
-const MAX_CEK_COL  = 21;
-const SKIP_COLOR   = ["RAB", "GAS", "SELISIH"];
-const LAPORAN_START = 5;
+const CEK_DATE_BG      = "#DAEEF3";
+const CEK_RAB_BG       = "#E8E8E8";
+const CEK_KOP_BG       = "#FFF8DC";
+const CEK_RAB_HDR      = "#BFBFBF";
+const CEK_KOP_HDR      = "#FFE699";
+const MAX_CEK_COL      = 21;
+const SUPPLIER_FONT    = "#1F497D";
+const NO_SUPPLIER_FONT = ["RAB", "GAS", "SELISIH"];
+const LAPORAN_START    = 5;
+const TODAY_BG         = "#FCE8B2";
 
 // --- angka ---
 
@@ -45,6 +51,13 @@ function toNum_(val) {
   return isNaN(n) ? 0 : n;
 }
 
+function nextWorkday_(date) {
+  const d = new Date(date);
+  d.setDate(d.getDate() + 1);
+  if (d.getDay() === 0) d.setDate(d.getDate() + 1); // skip Minggu
+  return d;
+}
+
 const hasVal_ = val => toNum_(val) !== 0;
 
 // --- menu & trigger ---
@@ -54,9 +67,9 @@ function onOpen() {
     .createMenu("📋 Menu")
     .addItem("Setup Laporan",    "setupLaporan")
     .addItem("Setup Pengecekan", "setupCek")
-    .addItem("Setup Warna",      "applyHarianColoring")
     .addItem("Selisih",          "recalculateAllSelisih")
     .addToUi();
+  highlightToday();
 }
 
 function onEdit(e) {
@@ -70,14 +83,14 @@ function onEdit(e) {
       if (cell === "A1") { e.range.setValue(false); setupLaporan(); return; }
       if (cell === "A2") { e.range.setValue(false); recalculateAllSelisih(); return; }
     }
-    // skip kolom A dan baris header sebelum parse
     const col = e.range.getColumn();
     if (col < 2) return;
     const parsed = parseHarianStructure_();
     if (!parsed || e.range.getRow() <= parsed.headerRow + 1) return;
     updateCekFromHarian_(e, parsed);
-    applyHarianColoringOnEdit_(e, parsed);
+    applySupplierFontOnEdit_(e, parsed);
     updateSelisihRow_(e, parsed);
+    highlightToday(parsed);
     return;
   }
 
@@ -89,7 +102,6 @@ function onEdit(e) {
 }
 
 // --- parse struktur HARIAN ---
-// dipanggil sekali, hasilnya dioper ke semua fungsi downstream
 
 function parseHarianStructure_() {
   const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET.HARIAN);
@@ -136,15 +148,14 @@ function parseHarianStructure_() {
 // --- selisih ---
 
 function writeSelisihCell_(sh, row, dapur, rowData) {
-  const rab = toNum_(rowData[dapur.rabCol]);
+  const rab  = toNum_(rowData[dapur.rabCol]);
   const cell = sh.getRange(row, dapur.selisihCol + 1);
   if (!rab) { cell.clearContent(); return; }
-  const total = dapur.supplierCols.reduce((s, c) => s + toNum_(rowData[c]), 0);
+  const total   = dapur.supplierCols.reduce((s, c) => s + toNum_(rowData[c]), 0);
   const selisih = rab - total;
-  cell.setValue(selisih).setNumberFormat('"Rp." #,##0').setFontWeight("bold");
-  if      (selisih > 0) cell.setBackground("#C6EFCE").setFontColor("#1E8449");
-  else if (selisih < 0) cell.setBackground("#FFC7CE").setFontColor("#C00000");
-  else                  cell.setBackground("#FFFFFF").setFontColor("#000000");
+  // plain di HARIAN — warna ada di LAPORAN
+  cell.setValue(selisih).setNumberFormat('"Rp." #,##0')
+    .setFontWeight("bold").setFontColor("#000000").setBackground(null);
 }
 
 function updateSelisihRow_(e, parsed) {
@@ -161,48 +172,90 @@ function updateSelisihRow_(e, parsed) {
   }
 }
 
+// recalcSelisih + apply font supplier batch — satu loop, tidak double highlight
 function recalculateAllSelisih() {
   const parsed = parseHarianStructure_();
   if (!parsed) return toast_("❌ Header HARIAN tidak ditemukan!");
-  const { dapurList, dataStartRow, data, sheet } = parsed;
+  const { dapurList, dataStartRow, data, sheet, subRow } = parsed;
+  const lastCol = sheet.getLastColumn();
+
+  // peta kolom supplier vs selisih — build sekali di luar loop
+  const supplierCols = [], selisihCols = [];
+  for (let c = 1; c < subRow.length; c++) {
+    const sub = String(subRow[c]).toUpperCase().trim();
+    if (!sub) continue;
+    if (sub === "SELISIH") selisihCols.push(c);
+    else if (!NO_SUPPLIER_FONT.includes(sub)) supplierCols.push(c);
+  }
+
+  // ambil semua data sekaligus untuk batch font
+  const startDataRow = dataStartRow + 1; // 1-indexed
+  const numRows = data.length - dataStartRow;
+  if (numRows <= 0) return toast_("⚠️ Tidak ada data.");
+
+  // build font color array untuk batch — semua kolom, semua baris
+  const fontArr = Array.from({ length: numRows }, (_, ri) => {
+    const rowData = data[dataStartRow + ri];
+    return Array.from({ length: lastCol }, (__, ci) => {
+      const sub = String(subRow[ci] || "").toUpperCase().trim();
+      if (NO_SUPPLIER_FONT.includes(sub)) return "#000000";
+      if (supplierCols.includes(ci)) return hasVal_(rowData[ci]) ? SUPPLIER_FONT : "#000000";
+      return "#000000";
+    });
+  });
+
+  // hitung selisih per baris
   let count = 0;
   for (let i = dataStartRow; i < data.length; i++) {
     if (!(data[i][0] instanceof Date)) continue;
     dapurList.forEach(d => writeSelisihCell_(sheet, i + 1, d, data[i]));
+    // clear sisa warna lama di kolom selisih
+    selisihCols.forEach(c => sheet.getRange(i + 1, c + 1).setBackground(null).setFontColor("#000000"));
     count++;
   }
-  toast_(`✅ Selisih dihitung ulang — ${count} baris.`);
-}
 
-// --- warna HARIAN ---
-
-function applyHarianColoring() {
-  const parsed = parseHarianStructure_();
-  if (!parsed) return toast_("❌ Header HARIAN tidak terbaca!");
-  const { sheet, headerRow, subRow } = parsed;
-  const lastRow = sheet.getLastRow();
-  const lastCol = sheet.getLastColumn();
-  if (lastRow <= headerRow + 1) return;
-  const startRow = headerRow + 2;
-  const numRows  = lastRow - startRow + 1;
-  const rng      = sheet.getRange(startRow, 1, numRows, lastCol);
-  const vals     = rng.getValues();
-  const bgs      = rng.getBackgrounds();
-  for (let c = 1; c < subRow.length; c++) {
-    const sub = String(subRow[c]).toUpperCase().trim();
-    if (!sub) continue;
-    for (let r = 0; r < numRows; r++) {
-      bgs[r][c] = SKIP_COLOR.includes(sub) ? null
-                : hasVal_(vals[r][c]) ? "#D9D9D9" : null;
-    }
+  // batch set font color semua baris sekaligus
+  if (numRows > 0) {
+    sheet.getRange(startDataRow, 1, numRows, lastCol).setFontColors(fontArr);
   }
-  rng.setBackgrounds(bgs);
+
+  highlightToday(parsed);
+  toast_(`✅ Selisih & warna diperbarui — ${count} baris.`);
 }
 
-function applyHarianColoringOnEdit_(e, parsed) {
+// --- font supplier on edit ---
+
+function applySupplierFontOnEdit_(e, parsed) {
   const sub = String(parsed.subRow[e.range.getColumn() - 1] || "").toUpperCase().trim();
-  if (!sub || SKIP_COLOR.includes(sub)) { e.range.setBackground(null); return; }
-  e.range.setBackground(hasVal_(e.range.getValue()) ? "#D9D9D9" : null);
+  if (!sub || NO_SUPPLIER_FONT.includes(sub)) return;
+  e.range.setFontColor(hasVal_(e.range.getValue()) ? SUPPLIER_FONT : "#000000");
+}
+
+// --- highlight hari ini ---
+// Efisien: hanya set 2 baris — reset kemarin, highlight hari ini
+// Full loop hanya saat parsed tidak diketahui row-nya (onOpen)
+
+function highlightToday(parsed) {
+  const p = parsed || parseHarianStructure_();
+  if (!p) return;
+  const { sheet, data, dataStartRow } = p;
+  const lastCol     = sheet.getLastColumn();
+  const tz          = Session.getScriptTimeZone();
+  const today       = Utilities.formatDate(new Date(), tz, "yyyy-MM-dd");
+  const tomorrowKey = Utilities.formatDate(nextWorkday_(new Date()), tz, "yyyy-MM-dd");
+
+  let todayRow = -1, tomorrowRow = -1, prevRow = -1;
+  for (let i = dataStartRow; i < data.length; i++) {
+    if (!(data[i][0] instanceof Date)) continue;
+    const key = Utilities.formatDate(data[i][0], tz, "yyyy-MM-dd");
+    if (key === today)            todayRow    = i + 1;
+    else if (key === tomorrowKey) tomorrowRow = i + 1;
+    else if (todayRow === -1)     prevRow     = i + 1;
+  }
+
+  if (prevRow > 0)     sheet.getRange(prevRow, 1, 1, lastCol).setBackground(null);
+  if (todayRow > 0)    sheet.getRange(todayRow, 1, 1, lastCol).setBackground(TODAY_BG);
+  if (tomorrowRow > 0) sheet.getRange(tomorrowRow, 1, 1, lastCol).setBackground("#E2EFDA");
 }
 
 // --- setup laporan ---
@@ -225,16 +278,14 @@ function setupLaporan() {
   const dv    = SpreadsheetApp.newDataValidation().requireDate().setAllowInvalid(false).build();
   const today = new Date();
   const first = new Date(today.getFullYear(), today.getMonth(), 1);
-  const fmt   = "dd-MM-yyyy";
-  const centerMid = { ha: "center", va: "middle" };
 
   lap.getRange("D1").setValue("TANGGAL AWAL").setFontWeight("bold")
     .setHorizontalAlignment("center").setVerticalAlignment("middle");
-  lap.getRange("E1").setValue(first).setNumberFormat(fmt).setDataValidation(dv)
+  lap.getRange("E1").setValue(first).setNumberFormat("dd-MM-yyyy").setDataValidation(dv)
     .setHorizontalAlignment("center").setVerticalAlignment("middle");
   lap.getRange("D2").setValue("TANGGAL AKHIR").setFontWeight("bold")
     .setHorizontalAlignment("center").setVerticalAlignment("middle");
-  lap.getRange("E2").setValue(today).setNumberFormat(fmt).setDataValidation(dv)
+  lap.getRange("E2").setValue(today).setNumberFormat("dd-MM-yyyy").setDataValidation(dv)
     .setHorizontalAlignment("center").setVerticalAlignment("middle");
   lap.getRange("C1:C3").setBackground("#FFFFFF");
 
@@ -250,9 +301,8 @@ function resetLaporan() {
   const lap = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET.LAPORAN);
   if (!lap) return;
   const last = lap.getLastRow();
-  if (last >= LAPORAN_START) {
+  if (last >= LAPORAN_START)
     lap.getRange(LAPORAN_START, 1, last - LAPORAN_START + 1, 11).clearContent().clearFormat();
-  }
   toast_("✅ Laporan direset.");
 }
 
@@ -261,11 +311,15 @@ function resetLaporan() {
 function setupCek() {
   const ss  = SpreadsheetApp.getActiveSpreadsheet();
   const cek = ss.getSheetByName(SHEET.CEK) || ss.insertSheet(SHEET.CEK);
+  // clear semua termasuk data lama — biar tidak duplikat kalau re-setup
   cek.clearContents().clearFormats();
+  const lastRow = cek.getLastRow();
+  if (lastRow > 2) cek.getRange(3, 1, lastRow - 2, cek.getLastColumn()).clearContent().clearFormat();
+
   const parsed = parseHarianStructure_();
   if (!parsed) return toast_("❌ Header HARIAN tidak ditemukan!");
 
-  const maxD = Math.floor((MAX_CEK_COL - 1) / 2);
+  const maxD      = Math.floor((MAX_CEK_COL - 1) / 2);
   const dapurList = parsed.dapurList.slice(0, maxD);
   if (parsed.dapurList.length > dapurList.length)
     ss.toast(`⚠️ Hanya ${dapurList.length} dapur ditampilkan (maks ${maxD}).`, "CEK", 5);
@@ -290,7 +344,7 @@ function setupCek() {
   cek.setColumnWidth(1, 110);
   for (let c = 2; c <= totalCols; c++) cek.setColumnWidth(c, 55);
   cek.getRange(1, 1, 2, totalCols).setBorder(true, true, true, true, true, true,
-    "#000000", SpreadsheetApp.BorderStyle.SOLID_MEDIUM);
+    "#000000", SpreadsheetApp.BorderStyle.SOLID);
   cek.setFrozenRows(2);
   populateCekFromHarian_(parsed, dapurList);
 }
@@ -311,7 +365,6 @@ function applyCekBorder_(cek, row, totalCols) {
     "#AAAAAA", SpreadsheetApp.BorderStyle.SOLID);
 }
 
-// populateCek pakai date cache — gak scan ulang per baris
 function populateCekFromHarian_(parsed, dapurList) {
   const cek = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET.CEK);
   if (!cek) return;
@@ -319,7 +372,6 @@ function populateCekFromHarian_(parsed, dapurList) {
   const totalCols = 1 + dapurList.length * 2;
   const tz = Session.getScriptTimeZone();
 
-  // build cache dari baris yang sudah ada
   const cache = {};
   const lastRow = cek.getLastRow();
   if (lastRow >= 3) {
@@ -349,21 +401,20 @@ function populateCekFromHarian_(parsed, dapurList) {
 
 function updateCekFromHarian_(e, parsed) {
   const { dapurList, headerRow } = parsed;
-  const maxD    = Math.floor((MAX_CEK_COL - 1) / 2);
-  const dapurs  = dapurList.slice(0, maxD);
-  const eRow    = e.range.getRow();
-  const eCol    = e.range.getColumn() - 1;
+  const maxD   = Math.floor((MAX_CEK_COL - 1) / 2);
+  const dapurs = dapurList.slice(0, maxD);
+  const eRow   = e.range.getRow();
+  const eCol   = e.range.getColumn() - 1;
   if (eRow <= headerRow + 1) return;
   const sh      = e.source.getActiveSheet();
   const rowData = sh.getRange(eRow, 1, 1, sh.getLastColumn()).getValues()[0];
   if (!(rowData[0] instanceof Date)) return;
-  const cek     = e.source.getSheetByName(SHEET.CEK);
+  const cek = e.source.getSheetByName(SHEET.CEK);
   if (!cek) return;
   const totalCols = 1 + dapurs.length * 2;
   const tz        = Session.getScriptTimeZone();
   const key       = Utilities.formatDate(rowData[0], tz, "yyyy-MM-dd");
 
-  // cari baris di CEK — scan sekali
   let cRow = -1;
   const last = cek.getLastRow();
   if (last >= 3) {
@@ -397,7 +448,6 @@ function updateCekFromHarian_(e, parsed) {
 }
 
 // --- kumpulkan data HARIAN dalam satu pass ---
-// return { laporan: { dapurList, totals }, gas: { gasList, totals } | null }
 
 function collectData_(parsed, start, end) {
   const { dapurList, data, dataStartRow } = parsed;
@@ -435,23 +485,16 @@ function collectData_(parsed, start, end) {
 
   const byName = (a, b) => a.name.localeCompare(b.name);
   return {
-    laporan: {
-      dapurList: [...dapurList].sort(byName),
-      totals: lTotals
-    },
-    gas: gasDapurs.length
-      ? { gasList: [...gasDapurs].sort(byName), totals: gTotals }
-      : null
+    laporan: { dapurList: [...dapurList].sort(byName), totals: lTotals },
+    gas: gasDapurs.length ? { gasList: [...gasDapurs].sort(byName), totals: gTotals } : null
   };
 }
 
 // --- tulis tabel laporan ---
-// Batch values + formatting — minimal API round trip
-// Return: last row ditulis
 
 function writeTabel_(lap, laporan, awal, akhir, startRow) {
   const { dapurList, totals } = laporan;
-  const n = dapurList.length;
+  const n        = dapurList.length;
   const titleRow = startRow;
   const hdrRow   = titleRow + 1;
   const dataRow  = titleRow + 2;
@@ -474,7 +517,6 @@ function writeTabel_(lap, laporan, awal, akhir, startRow) {
     .setHorizontalAlignment("center").setVerticalAlignment("middle");
   lap.setRowHeight(hdrRow, 26);
 
-  // build batch arrays
   const vals = [], bgs = [], fontColors = [], fontWeights = [];
   dapurList.forEach((d, i) => {
     const t   = totals[d.name];
@@ -487,12 +529,11 @@ function writeTabel_(lap, laporan, awal, akhir, startRow) {
     fontWeights.push(["normal", "normal", "normal", "normal", "bold"]);
   });
 
-  // total row
-  const totB = dapurList.reduce((s, d) => s + totals[d.name].belanja,   0);
-  const totK = dapurList.reduce((s, d) => s + totals[d.name].koperasi,  0);
-  const totS = dapurList.reduce((s, d) => s + totals[d.name].sisa,      0);
+  const totB = dapurList.reduce((s, d) => s + totals[d.name].belanja,  0);
+  const totK = dapurList.reduce((s, d) => s + totals[d.name].koperasi, 0);
+  const totS = dapurList.reduce((s, d) => s + totals[d.name].sisa,     0);
   vals.push(["TOTAL", "", totB, totK, totS]);
-  bgs.push(["#4472C4", "#4472C4", "#4472C4", "#4472C4", "#4472C4"]);
+  bgs.push(["#4472C4","#4472C4","#4472C4","#4472C4","#4472C4"]);
   fontColors.push(["#FFFFFF","#FFFFFF","#FFFFFF","#FFFFFF","#FFFFFF"]);
   fontWeights.push(["bold","bold","bold","bold","bold"]);
 
@@ -503,7 +544,7 @@ function writeTabel_(lap, laporan, awal, akhir, startRow) {
   lap.getRange(dataRow, 3, n + 1, 3).setNumberFormat('"Rp." #,##0');
 
   lap.getRange(titleRow, 1, n + 3, 5).setBorder(true, true, true, true, true, true,
-    "#000000", SpreadsheetApp.BorderStyle.SOLID_MEDIUM);
+    "#000000", SpreadsheetApp.BorderStyle.SOLID);
 
   return writeSupplierDetail_(lap, laporan, dataRow + n);
 }
@@ -539,7 +580,7 @@ function writeSupplierDetail_(lap, laporan, mainEndRow) {
   dataRng.setValues(vals).setBackgrounds(bgs).setHorizontalAlignment("center");
   lap.getRange(startRow + 2, 2, multi.length, allSuppliers.length).setNumberFormat('"Rp." #,##0');
   lap.getRange(startRow, 1, multi.length + 2, ncols).setBorder(true, true, true, true, true, true,
-    "#000000", SpreadsheetApp.BorderStyle.SOLID_MEDIUM);
+    "#000000", SpreadsheetApp.BorderStyle.SOLID);
 
   return startRow + 1 + multi.length;
 }
@@ -548,7 +589,7 @@ function writeSupplierDetail_(lap, laporan, mainEndRow) {
 
 function writeTabelGas_(lap, gas, awal, akhir, startRow) {
   const { gasList, totals } = gas;
-  const n      = gasList.length;
+  const n        = gasList.length;
   const titleRow = startRow;
   const hdrRow   = titleRow + 1;
   const dataRow  = titleRow + 2;
@@ -577,23 +618,24 @@ function writeTabelGas_(lap, gas, awal, akhir, startRow) {
   });
   const totGas = gasList.reduce((s, d) => s + totals[d.name].gas, 0);
   vals.push(["TOTAL", "", totGas]);
-  bgs.push(["#4472C4", "#4472C4", "#4472C4"]);
+  bgs.push(["#4472C4","#4472C4","#4472C4"]);
 
   const dataRng = lap.getRange(dataRow, 1, n + 1, 3);
-  dataRng.setValues(vals).setBackgrounds(bgs).setHorizontalAlignment("center").setVerticalAlignment("middle");
+  dataRng.setValues(vals).setBackgrounds(bgs)
+    .setHorizontalAlignment("center").setVerticalAlignment("middle");
   lap.getRange(dataRow + n, 1, 1, 3).setFontWeight("bold").setFontColor("#FFFFFF");
   lap.getRange(dataRow, 2, n + 1, 1).setNumberFormat("#,##0");
   lap.getRange(dataRow, 3, n + 1, 1).setNumberFormat('"Rp." #,##0');
 
   lap.getRange(titleRow, 1, n + 3, 3).setBorder(true, true, true, true, true, true,
-    "#000000", SpreadsheetApp.BorderStyle.SOLID_MEDIUM);
+    "#000000", SpreadsheetApp.BorderStyle.SOLID);
 
   return dataRow + n;
 }
 
 // --- rekap per bank ---
 
-function writeRekapBank_(lap, laporan, gas, startRow) {
+function writeRekapBank_(lap, laporan, gas, startRow, awal, akhir) {
   const { dapurList, totals } = laporan;
   const briNames = BRI_DAPURS.map(n => n.toUpperCase());
 
@@ -602,21 +644,33 @@ function writeRekapBank_(lap, laporan, gas, startRow) {
     if (briNames.includes(d.name.toUpperCase())) briRab += totals[d.name].belanja;
     else                                          bniRab += totals[d.name].belanja;
   });
-  const bniGas = gas
-    ? Object.values(gas.totals).reduce((s, t) => s + t.gas, 0)
-    : 0;
 
-  const briTotal   = briRab;
+  let briGas = 0, bniGas = 0;
+  if (gas) {
+    const briGasNames = BRI_GAS_DAPURS.map(n => n.toUpperCase());
+    gas.gasList.forEach(d => {
+      if (briGasNames.includes(d.name.toUpperCase())) briGas += gas.totals[d.name].gas;
+      else                                             bniGas += gas.totals[d.name].gas;
+    });
+  }
+
+  const briTotal   = briRab + briGas;
   const bniTotal   = bniRab + bniGas;
   const grandTotal = briTotal + bniTotal;
+  const titleRow   = startRow;
+  const hdrRow     = titleRow + 1;
 
-  const titleRow = startRow;
-  const hdrRow   = titleRow + 1;
-
-  lap.getRange(titleRow, 1, 1, 4).merge().setValue("REKAP PENCAIRAN PER BANK")
+  lap.getRange(titleRow, 1, 1, 2).merge()
+    .setValue("REKAP PENCAIRAN PER BANK")
     .setFontWeight("bold").setFontSize(12)
     .setHorizontalAlignment("center").setVerticalAlignment("middle")
     .setBackground("#4472C4").setFontColor("#FFFFFF");
+  lap.getRange(titleRow, 3).setValue(awal).setNumberFormat("dd-MM-yyyy")
+    .setFontWeight("bold").setBackground("#4472C4").setFontColor("#b6d7a8")
+    .setHorizontalAlignment("center").setVerticalAlignment("middle");
+  lap.getRange(titleRow, 4).setValue(akhir).setNumberFormat("dd-MM-yyyy")
+    .setFontWeight("bold").setBackground("#4472C4").setFontColor("#ea9999")
+    .setHorizontalAlignment("center").setVerticalAlignment("middle");
   lap.setRowHeight(titleRow, 28);
 
   lap.getRange(hdrRow, 1, 1, 4)
@@ -624,32 +678,30 @@ function writeRekapBank_(lap, laporan, gas, startRow) {
     .setFontWeight("bold").setBackground("#BDD7EE")
     .setHorizontalAlignment("center").setVerticalAlignment("middle");
 
-  // BRI, BNI, TOTAL rows sekaligus
   const vals = [
-    ["BRI", briRab, "-",    briTotal],
-    ["BNI", bniRab, bniGas, bniTotal],
-    ["TOTAL", briRab + bniRab, bniGas, grandTotal]
+    ["BRI",   briRab,          briGas,          briTotal],
+    ["BNI",   bniRab,          bniGas,          bniTotal],
+    ["TOTAL", briRab + bniRab, briGas + bniGas, grandTotal]
   ];
-  const rowBgs    = ["#FFF9E6", "#E8F4FF", "#4472C4"];
-  const rowFonts  = ["#000000", "#000000", "#FFFFFF"];
-  const rowWeight = ["normal",  "normal",  "bold"];
+  const bgs = [
+    ["#FFFFFF","#FFFFFF","#FFFFFF","#FFFFFF"],
+    ["#F0F4FA","#F0F4FA","#F0F4FA","#F0F4FA"],
+    ["#4472C4","#4472C4","#4472C4","#4472C4"]
+  ];
+  const fontColors  = [["#000000","#000000","#000000","#000000"],
+                       ["#000000","#000000","#000000","#000000"],
+                       ["#FFFFFF","#FFFFFF","#FFFFFF","#FFFFFF"]];
+  const fontWeights = [["normal","normal","normal","normal"],
+                       ["normal","normal","normal","normal"],
+                       ["bold","bold","bold","bold"]];
 
-  vals.forEach((row, i) => {
-    const r = hdrRow + 1 + i;
-    lap.getRange(r, 1, 1, 4).setValues([row])
-      .setHorizontalAlignment("center").setVerticalAlignment("middle")
-      .setBackground(rowBgs[i]).setFontColor(rowFonts[i]).setFontWeight(rowWeight[i]);
-    // format kolom angka, kecuali BRI gas yang "-"
-    if (i === 0) {
-      lap.getRange(r, 2).setNumberFormat('"Rp." #,##0');
-      lap.getRange(r, 4).setNumberFormat('"Rp." #,##0');
-    } else {
-      lap.getRange(r, 2, 1, 3).setNumberFormat('"Rp." #,##0');
-    }
-  });
+  const dataRng = lap.getRange(hdrRow + 1, 1, 3, 4);
+  dataRng.setValues(vals).setBackgrounds(bgs).setFontColors(fontColors)
+    .setFontWeights(fontWeights).setHorizontalAlignment("center").setVerticalAlignment("middle");
+  lap.getRange(hdrRow + 1, 2, 3, 3).setNumberFormat('"Rp." #,##0');
 
-  lap.getRange(titleRow, 1, 4, 4).setBorder(true, true, true, true, true, true,
-    "#000000", SpreadsheetApp.BorderStyle.SOLID_MEDIUM);
+  lap.getRange(titleRow, 1, 5, 4).setBorder(true, true, true, true, true, true,
+    "#000000", SpreadsheetApp.BorderStyle.SOLID);
 }
 
 // --- generate (unified) ---
@@ -669,13 +721,11 @@ function generateLaporan() {
   const start = new Date(awal);  start.setHours(0, 0, 0, 0);
   const end   = new Date(akhir); end.setHours(23, 59, 59, 999);
 
-  // satu kali loop untuk semua data
   const res = collectData_(parsed, start, end);
   if (!res) return toast_("⚠️ Tidak ada data di rentang tanggal tersebut.");
 
   clearTableArea_(lap);
 
-  // sort laporan by selisih ascending
   res.laporan.dapurList.sort((a, b) =>
     res.laporan.totals[a.name].sisa - res.laporan.totals[b.name].sisa
   );
@@ -684,7 +734,7 @@ function generateLaporan() {
   const afterGas     = res.gas
     ? writeTabelGas_(lap, res.gas, awal, akhir, afterLaporan + 2)
     : afterLaporan;
-  writeRekapBank_(lap, res.laporan, res.gas, afterGas + 2);
+  writeRekapBank_(lap, res.laporan, res.gas, afterGas + 2, awal, akhir);
 
   toast_("✅ Laporan selesai.");
 }
